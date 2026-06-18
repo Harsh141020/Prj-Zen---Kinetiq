@@ -1,0 +1,144 @@
+# docker-compose.yml (Final Version with Corrected Kafka Dependency)
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.0.1
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_ID: booking-group
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:14.1
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: ticketing
+    command: postgres -c max_connections=1000
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d ticketing"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6379:6379"
+
+  mongo:
+    image: mongo:5.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: user
+      MONGO_INITDB_ROOT_PASSWORD: password
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh -u user -p password --quiet
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # --- OUR APPLICATION MICROSERVICES ---
+  write-api:
+    build: ./write-api
+    ports: # Added ports back for direct testing if needed
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: write-api
+      KAFKA_TOPIC_BOOKING: booking-requests
+    depends_on:
+      kafka:
+        condition: service_healthy # <--- THIS IS THE FIX
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: ./worker
+    environment:
+      KAFKA_BROKER: kafka:9092
+      KAFKA_CLIENT_ID: worker
+      KAFKA_GROUP_ID: booking-group
+      KAFKA_TOPIC_BOOKING: booking-requests
+      REDIS_URL: redis://redis:6379
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DATABASE: ticketing
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      LOCK_TTL_SECONDS: 30
+    depends_on:
+      kafka:
+        condition: service_healthy # <--- THIS IS THE FIX
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  read-api:
+    build: ./read-api
+    ports: # Added ports back for direct testing if needed
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      MONGO_URI: mongodb://user:password@mongo:27017/ticketingReadDB?authSource=admin
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  data-sync-service:
+    build: ./data-sync-service
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DATABASE: ticketing
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      MONGO_URI: mongodb://user:password@mongo:27017/ticketingReadDB?authSource=admin
+      SYNC_INTERVAL_MS: 5000
+    depends_on:
+      mongo:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # --- API GATEWAY SERVICE ---
+  nginx:
+    image: nginx:1.21-alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - write-api
+      - read-api
+
+volumes:
+  postgres_data:
+  mongo_data:
